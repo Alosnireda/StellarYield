@@ -27,6 +27,10 @@ import { useProtectedWalletAction } from "../../hooks/useProtectedWalletAction";
 import SessionExpiredRecovery from "../../components/wallet/SessionExpiredRecovery";
 import RedemptionPreviewPanel from "./RedemptionPreviewPanel";
 import {
+  formatSettlementTimeRemaining,
+  getSettlementWindowStatus,
+} from "./settlementWindow";
+import {
   PARTIAL_WITHDRAWAL_PRESETS,
   buildRedemptionView,
   sharesForPreset,
@@ -63,6 +67,11 @@ interface WithdrawalPreview {
   expiresAt?: string;
   quoteTtlMs?: number;
   reserveImpact?: ReserveImpactPreview;
+}
+
+interface ConfirmedSettlementWindow {
+  estimatedReadyAt: string;
+  delayLabel: string;
 }
 
 // Fallback USD rate — in production this would come from a price oracle.
@@ -274,6 +283,9 @@ export default function WithdrawPanel({ walletAddress }: WithdrawPanelProps) {
   const [txPhase, setTxPhase] = useState<TxPhase>("idle");
   const [lastProgressPhase, setLastProgressPhase] = useState<TxPhase>("idle");
   const [txHash, setTxHash] = useState<string | null>(null);
+  const [settlementWindow, setSettlementWindow] =
+    useState<ConfirmedSettlementWindow | null>(null);
+  const [settlementNowMs, setSettlementNowMs] = useState(() => Date.now());
   const [error, setError] = useState("");
   const [showFailedModal, setShowFailedModal] = useState(false);
   const [submitting, setSubmitting] = useState(false);
@@ -300,6 +312,17 @@ export default function WithdrawPanel({ walletAddress }: WithdrawPanelProps) {
   const quoteAgeSecs = preview
     ? withdrawQuoteAgeSeconds(preview.quotedAt, quoteNowMs)
     : null;
+
+  useEffect(() => {
+    if (!settlementWindow) return;
+    const estimatedReadyAtMs = Date.parse(settlementWindow.estimatedReadyAt);
+    const interval = setInterval(() => {
+      const nowMs = Date.now();
+      setSettlementNowMs(nowMs);
+      if (nowMs >= estimatedReadyAtMs) clearInterval(interval);
+    }, 1000);
+    return () => clearInterval(interval);
+  }, [settlementWindow]);
 
   const refreshPreview = useCallback(() => {
     setQuoteNowMs(Date.now());
@@ -503,6 +526,7 @@ export default function WithdrawPanel({ walletAddress }: WithdrawPanelProps) {
     setLastProgressPhase("idle");
     setTxPhase("idle");
     setTxHash(null);
+    setSettlementWindow(null);
     setError("");
     setShowFailedModal(false);
     setSubmitting(true);
@@ -513,6 +537,19 @@ export default function WithdrawPanel({ walletAddress }: WithdrawPanelProps) {
         throw new Error(result.error || "Withdrawal failed");
       }
       setTxHash(result.hash ?? null);
+      if (
+        preview &&
+        Number.isFinite(preview.processingDelaySeconds) &&
+        preview.processingDelaySeconds > 5
+      ) {
+        setSettlementWindow({
+          estimatedReadyAt: new Date(
+            Date.now() + preview.processingDelaySeconds * 1000,
+          ).toISOString(),
+          delayLabel: preview.processingDelayLabel,
+        });
+        setSettlementNowMs(Date.now());
+      }
       setAmount("");
       setPreview(null);
       void refreshBalance();
@@ -581,6 +618,13 @@ export default function WithdrawPanel({ walletAddress }: WithdrawPanelProps) {
   // Preview is required before submission; it blocks when an API error occurred.
   const previewMissing = Boolean(amount && previewError && !preview);
   const staleBlocked = Boolean(preview && !previewLoading && isStaleQuote);
+  const settlementReadyAtMs = settlementWindow
+    ? Date.parse(settlementWindow.estimatedReadyAt)
+    : null;
+  const settlementStatus =
+    settlementReadyAtMs !== null && Number.isFinite(settlementReadyAtMs)
+      ? getSettlementWindowStatus(settlementReadyAtMs, settlementNowMs)
+      : null;
 
   if (!walletAddress) {
     return (
@@ -725,6 +769,35 @@ export default function WithdrawPanel({ walletAddress }: WithdrawPanelProps) {
         onRetry={txPhase === "failure" ? retryWithdraw : undefined}
         className="mb-4"
       />
+
+      {settlementWindow && settlementStatus && settlementReadyAtMs !== null && txPhase === "success" && (
+        <div
+          role="status"
+          aria-live="polite"
+          className="mb-4 rounded-lg border border-indigo-400/30 bg-indigo-500/10 p-3 text-sm text-indigo-100"
+          data-testid="withdraw-settlement-window"
+        >
+          {settlementStatus.state === "pending" ? (
+            <>
+              <p className="font-medium">Delayed settlement window</p>
+              <p className="mt-1 text-xs text-indigo-100/80">
+                Transaction confirmed. Estimated settlement: {settlementWindow.delayLabel}.
+                Estimated availability by{" "}
+                {new Date(settlementReadyAtMs).toLocaleTimeString()} (
+                {formatSettlementTimeRemaining(settlementStatus.remainingSeconds)} remaining).
+              </p>
+            </>
+          ) : (
+            <>
+              <p className="font-medium">Estimated settlement window elapsed</p>
+              <p className="mt-1 text-xs text-indigo-100/80">
+                The {settlementWindow.delayLabel.toLowerCase()} estimate has elapsed.
+                This does not confirm settlement; check your wallet balance for the latest status.
+              </p>
+            </>
+          )}
+        </div>
+      )}
 
       <button
         type="button"

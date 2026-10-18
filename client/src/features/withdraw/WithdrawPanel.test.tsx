@@ -120,6 +120,39 @@ describe("WithdrawPanel", () => {
     });
   });
 
+  it("shows the estimated settlement window after a delayed withdrawal confirms", async () => {
+    mockApiFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        vaultId: "usdc",
+        requestedAmountUsd: 10,
+        exitFeeUsd: 0,
+        exitFeeBps: 0,
+        processingDelayLabel: "Up to 24 hours (queued redemption)",
+        processingDelaySeconds: 86_400,
+        estimatedNetUsd: 10,
+        optimisticNetUsd: 10,
+        conservativeNetUsd: 10,
+        priceImpactPct: 0,
+        isLowLiquidity: false,
+        quotedAt: new Date().toISOString(),
+      }),
+    } as Response);
+    mockWithdraw.mockImplementation(async (_addr, _shares, onPhase) => {
+      onPhase?.("success");
+      return { success: true, hash: "queued-withdrawal" };
+    });
+
+    render(<WithdrawPanel walletAddress="GABCDEF123" />);
+    await typeAmountAndAwaitReadyButton("10");
+    fireEvent.click(screen.getByRole("button", { name: /^Withdraw$/i }));
+
+    const window = await screen.findByTestId("withdraw-settlement-window");
+    expect(window).toHaveTextContent("Delayed settlement window");
+    expect(window).toHaveTextContent("Up to 24 hours (queued redemption)");
+    expect(window).toHaveTextContent("Estimated availability by");
+  });
+
   it("shows the failure modal with recovery guidance when withdraw fails", async () => {
     mockWithdraw.mockImplementation(async (_addr, _shares, onPhase) => {
       onPhase?.("simulating");
