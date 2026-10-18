@@ -597,6 +597,19 @@ impl IsolatedLendingPair {
     /// A call that reverts (e.g. a rejected token transfer) does not consume the
     /// id. If the collateral runs out, the remaining debt is written off to bad debt.
     /// Returns the collateral seized.
+    ///
+    /// ## Market isolation (#1478)
+    /// A pair is one market. Everything a liquidation touches belongs to that
+    /// market alone: the borrower's position and the liquidation id are read
+    /// from this pair's storage, the liquidator repays in this pair's debt
+    /// token, and the seized collateral is paid out of this pair's own holdings
+    /// of this pair's collateral token. Another market's debt, collateral,
+    /// liquidity or bad debt can never be used to settle this one, even when
+    /// markets share a token, because each market's balance is held by its own
+    /// contract. Before paying out, the pair checks that it really holds the
+    /// collateral it is about to seize, so a position that is not backed by
+    /// this market's funds fails with `InsufficientCollateral` instead of
+    /// reaching for anything else.
     pub fn liquidate(
         env: Env,
         liquidator: Address,
@@ -681,6 +694,13 @@ impl IsolatedLendingPair {
             .instance()
             .get(&PairDataKey::CollateralToken)
             .unwrap();
+        // Isolation guard (#1478): only this market's own holdings can be paid out.
+        if token::Client::new(&env, &collateral_token).balance(&env.current_contract_address())
+            < seized
+        {
+            return Err(IsolatedLendingError::InsufficientCollateral);
+        }
+
         token::Client::new(&env, &debt_token).transfer(
             &liquidator,
             &env.current_contract_address(),
@@ -1288,7 +1308,10 @@ mod test {
         assert_eq!(s.pair.get_position(&s.borrower), (100, 50));
         assert_eq!(s.pair.get_totals(), (1_000, 50));
         assert_eq!(balance(&s.env, &s.debt_token, &payer), 0);
-        assert_eq!(balance(&s.env, &s.debt_token, &s.borrower), borrower_balance);
+        assert_eq!(
+            balance(&s.env, &s.debt_token, &s.borrower),
+            borrower_balance
+        );
         assert_eq!(s.pair.get_position(&payer), (0, 0));
     }
 
@@ -1736,5 +1759,331 @@ mod test {
             s.pair.try_push_oracle_quote(&impostor, &10_000, &9_000),
             Err(Ok(IsolatedLendingError::Unauthorized))
         );
+    }
+
+    // ── Market isolation during liquidation (#1478) ─────────────────
+
+    /// Opens an independent market on the shared `env`: the lender supplies
+    /// 1_000 of `debt_token`, the borrower posts 100 of `collateral_token` and
+    /// borrows 80, at an 80% collateral factor.
+    fn open_market(
+        env: &Env,
+        admin: &Address,
+        collateral_token: &Address,
+        debt_token: &Address,
+        lender: &Address,
+        borrower: &Address,
+    ) -> IsolatedLendingPairClient<'static> {
+        let pair_id = env.register(IsolatedLendingPair, ());
+        let pair = IsolatedLendingPairClient::new(env, &pair_id);
+        pair.initialize(admin, collateral_token, debt_token, &8_000);
+        mint(env, debt_token, lender, 1_000);
+        mint(env, collateral_token, borrower, 100);
+        pair.supply(lender, &1_000);
+        pair.post_collateral(borrower, &100);
+        pair.borrow(borrower, &80);
+        pair
+    }
+
+    struct TwoMarkets {
+        env: Env,
+        admin: Address,
+        borrower: Address,
+        lender: Address,
+        col_a: Address,
+        debt_a: Address,
+        col_b: Address,
+        debt_b: Address,
+        market_a: IsolatedLendingPairClient<'static>,
+        market_b: IsolatedLendingPairClient<'static>,
+    }
+
+    fn new_token(env: &Env) -> Address {
+        env.register_stellar_asset_contract_v2(Address::generate(env))
+            .address()
+    }
+
+    /// Two simultaneous markets with entirely separate tokens, and the same
+    /// borrower and lender active in both.
+    fn two_markets() -> TwoMarkets {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let borrower = Address::generate(&env);
+        let lender = Address::generate(&env);
+        let (col_a, debt_a, col_b, debt_b) = (
+            new_token(&env),
+            new_token(&env),
+            new_token(&env),
+            new_token(&env),
+        );
+        let market_a = open_market(&env, &admin, &col_a, &debt_a, &lender, &borrower);
+        let market_b = open_market(&env, &admin, &col_b, &debt_b, &lender, &borrower);
+        TwoMarkets {
+            env,
+            admin,
+            borrower,
+            lender,
+            col_a,
+            debt_a,
+            col_b,
+            debt_b,
+            market_a,
+            market_b,
+        }
+    }
+
+    #[test]
+    fn two_markets_hold_independent_positions() {
+        let m = two_markets();
+        assert_eq!(m.market_a.get_position(&m.borrower), (100, 80));
+        assert_eq!(m.market_b.get_position(&m.borrower), (100, 80));
+        assert_eq!(m.market_a.get_totals(), (1_000, 80));
+        assert_eq!(m.market_b.get_totals(), (1_000, 80));
+    }
+
+    #[test]
+    fn liquidating_one_market_leaves_the_other_untouched() {
+        let m = two_markets();
+        m.market_a.set_collateral_factor(&m.admin, &4_000);
+        let liquidator = Address::generate(&m.env);
+        mint(&m.env, &m.debt_a, &liquidator, 80);
+
+        let b_before = (
+            m.market_b.get_position(&m.borrower),
+            m.market_b.get_totals(),
+            m.market_b.get_bad_debt(),
+            balance(&m.env, &m.col_b, &m.market_b.address),
+            balance(&m.env, &m.debt_b, &m.market_b.address),
+        );
+
+        assert_eq!(m.market_a.liquidate(&liquidator, &m.borrower, &1, &80), 80);
+
+        assert_eq!(m.market_a.get_position(&m.borrower), (20, 0));
+        let b_after = (
+            m.market_b.get_position(&m.borrower),
+            m.market_b.get_totals(),
+            m.market_b.get_bad_debt(),
+            balance(&m.env, &m.col_b, &m.market_b.address),
+            balance(&m.env, &m.debt_b, &m.market_b.address),
+        );
+        assert_eq!(b_before, b_after);
+        // B's debt is still owed in full and B's lender can still be repaid.
+        assert_eq!(m.market_b.get_position(&m.borrower), (100, 80));
+    }
+
+    #[test]
+    fn a_liquidator_paying_the_other_markets_debt_token_cannot_liquidate() {
+        let m = two_markets();
+        m.market_a.set_collateral_factor(&m.admin, &4_000);
+        // Holds plenty of market B's debt token, none of market A's.
+        let liquidator = Address::generate(&m.env);
+        mint(&m.env, &m.debt_b, &liquidator, 1_000);
+
+        let res = m.market_a.try_liquidate(&liquidator, &m.borrower, &1, &80);
+
+        assert!(res.is_err());
+        assert_eq!(m.market_a.get_position(&m.borrower), (100, 80));
+        assert_eq!(m.market_b.get_position(&m.borrower), (100, 80));
+        assert_eq!(balance(&m.env, &m.debt_b, &liquidator), 1_000);
+        assert_eq!(balance(&m.env, &m.col_a, &liquidator), 0);
+    }
+
+    #[test]
+    fn a_position_unhealthy_only_in_another_market_cannot_be_liquidated_here() {
+        let m = two_markets();
+        // Only market B turns unhealthy for the shared borrower.
+        m.market_b.set_collateral_factor(&m.admin, &4_000);
+        let liquidator = Address::generate(&m.env);
+        mint(&m.env, &m.debt_a, &liquidator, 80);
+        mint(&m.env, &m.debt_b, &liquidator, 80);
+
+        assert_eq!(
+            m.market_a.try_liquidate(&liquidator, &m.borrower, &1, &80),
+            Err(Ok(IsolatedLendingError::PositionStillBacked))
+        );
+        assert_eq!(m.market_a.get_position(&m.borrower), (100, 80));
+
+        // The unhealthy market can still be liquidated on its own terms.
+        assert_eq!(m.market_b.liquidate(&liquidator, &m.borrower, &1, &80), 80);
+        assert_eq!(m.market_a.get_position(&m.borrower), (100, 80));
+    }
+
+    #[test]
+    fn a_borrower_with_no_position_in_a_market_cannot_be_liquidated_there() {
+        let m = two_markets();
+        m.market_a.set_collateral_factor(&m.admin, &4_000);
+        let stranger = Address::generate(&m.env);
+        let liquidator = Address::generate(&m.env);
+        mint(&m.env, &m.debt_a, &liquidator, 80);
+
+        // No collateral and no debt: nothing to take.
+        assert!(m
+            .market_a
+            .try_liquidate(&liquidator, &stranger, &1, &80)
+            .is_err());
+        assert_eq!(balance(&m.env, &m.debt_a, &liquidator), 80);
+    }
+
+    #[test]
+    fn liquidation_ids_are_scoped_to_their_market() {
+        let m = two_markets();
+        m.market_a.set_collateral_factor(&m.admin, &4_000);
+        m.market_b.set_collateral_factor(&m.admin, &4_000);
+        let liquidator = Address::generate(&m.env);
+        mint(&m.env, &m.debt_a, &liquidator, 80);
+        mint(&m.env, &m.debt_b, &liquidator, 80);
+
+        // Id 7 is consumed in market A only.
+        m.market_a.liquidate(&liquidator, &m.borrower, &7, &40);
+        assert_eq!(
+            m.market_a.try_liquidate(&liquidator, &m.borrower, &7, &40),
+            Err(Ok(IsolatedLendingError::AlreadyLiquidated))
+        );
+        // The same id in market B is a different liquidation.
+        assert_eq!(m.market_b.liquidate(&liquidator, &m.borrower, &7, &40), 40);
+        assert_eq!(m.market_b.get_position(&m.borrower), (60, 40));
+    }
+
+    #[test]
+    fn bad_debt_is_recorded_only_in_the_market_that_incurred_it() {
+        let m = two_markets();
+        // Collateral in A is worth 50 against 80 of debt.
+        m.market_a.set_collateral_price(&m.admin, &5_000);
+        let liquidator = Address::generate(&m.env);
+        mint(&m.env, &m.debt_a, &liquidator, 80);
+
+        m.market_a.liquidate(&liquidator, &m.borrower, &1, &80);
+
+        assert_eq!(m.market_a.get_bad_debt(), 30);
+        assert_eq!(m.market_b.get_bad_debt(), 0);
+        assert_eq!(m.market_b.get_totals(), (1_000, 80));
+    }
+
+    #[test]
+    fn markets_sharing_a_debt_token_do_not_share_liquidity() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let borrower = Address::generate(&env);
+        let lender_a = Address::generate(&env);
+        let lender_b = Address::generate(&env);
+        let shared_debt = new_token(&env);
+        let col_a = new_token(&env);
+        let col_b = new_token(&env);
+        let market_a = open_market(&env, &admin, &col_a, &shared_debt, &lender_a, &borrower);
+        let market_b = open_market(&env, &admin, &col_b, &shared_debt, &lender_b, &borrower);
+
+        market_a.set_collateral_factor(&admin, &4_000);
+        let liquidator = Address::generate(&env);
+        mint(&env, &shared_debt, &liquidator, 80);
+        market_a.liquidate(&liquidator, &borrower, &1, &80);
+
+        // The liquidator's repayment stays with market A.
+        assert_eq!(balance(&env, &shared_debt, &market_a.address), 920 + 80);
+        assert_eq!(balance(&env, &shared_debt, &market_b.address), 920);
+        // Market B's lender can still withdraw only what market B holds.
+        assert_eq!(market_b.get_available_liquidity(), 920);
+        assert_eq!(market_b.get_totals(), (1_000, 80));
+        assert_eq!(market_b.get_position(&borrower), (100, 80));
+    }
+
+    #[test]
+    fn markets_sharing_a_collateral_token_pay_out_only_their_own_holdings() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let borrower = Address::generate(&env);
+        let lender = Address::generate(&env);
+        let shared_collateral = new_token(&env);
+        let debt_a = new_token(&env);
+        let debt_b = new_token(&env);
+        let market_a = open_market(
+            &env,
+            &admin,
+            &shared_collateral,
+            &debt_a,
+            &lender,
+            &borrower,
+        );
+        let market_b = open_market(
+            &env,
+            &admin,
+            &shared_collateral,
+            &debt_b,
+            &lender,
+            &borrower,
+        );
+        assert_eq!(balance(&env, &shared_collateral, &market_a.address), 100);
+        assert_eq!(balance(&env, &shared_collateral, &market_b.address), 100);
+
+        // Market A's collateral is nearly worthless: a full liquidation seizes
+        // every unit market A holds, and nothing from market B.
+        market_a.set_collateral_price(&admin, &1_000);
+        let liquidator = Address::generate(&env);
+        mint(&env, &debt_a, &liquidator, 80);
+        let seized = market_a.liquidate(&liquidator, &borrower, &1, &80);
+
+        assert_eq!(seized, 100);
+        assert_eq!(balance(&env, &shared_collateral, &market_a.address), 0);
+        assert_eq!(balance(&env, &shared_collateral, &market_b.address), 100);
+        assert_eq!(balance(&env, &shared_collateral, &liquidator), 100);
+        assert_eq!(market_b.get_position(&borrower), (100, 80));
+    }
+
+    #[test]
+    fn a_market_cannot_pay_out_collateral_it_does_not_hold() {
+        let s = setup();
+        // Corrupt the books: the pair believes the borrower posted far more
+        // collateral than the contract actually holds (100).
+        s.env.as_contract(&s.pair.address, || {
+            s.env
+                .storage()
+                .persistent()
+                .set(&PairDataKey::Collateral(s.borrower.clone()), &1_000_i128);
+        });
+        s.pair.set_collateral_price(&s.admin, &900); // limit 72 < debt 80
+        let liquidator = Address::generate(&s.env);
+        mint(&s.env, &s.debt_token, &liquidator, 80);
+
+        // 80 / 0.09 = 888 collateral would be seized; the pair holds 100.
+        assert_eq!(
+            s.pair.try_liquidate(&liquidator, &s.borrower, &1, &80),
+            Err(Ok(IsolatedLendingError::InsufficientCollateral))
+        );
+        // Rejected cleanly: no tokens moved and the liquidation id is still free.
+        assert_eq!(balance(&s.env, &s.debt_token, &liquidator), 80);
+        assert_eq!(balance(&s.env, &s.collateral_token, &liquidator), 0);
+        assert_eq!(balance(&s.env, &s.collateral_token, &s.pair.address), 100);
+        s.env.as_contract(&s.pair.address, || {
+            assert!(!s
+                .env
+                .storage()
+                .persistent()
+                .has(&PairDataKey::Liquidation(s.borrower.clone(), 1)));
+        });
+    }
+
+    #[test]
+    fn factory_pairs_for_different_token_pairs_are_distinct_markets() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let factory_id = env.register(IsolatedLendingFactory, ());
+        let factory = IsolatedLendingFactoryClient::new(&env, &factory_id);
+        factory.initialize_factory(&admin);
+        let (a, b, c) = (new_token(&env), new_token(&env), new_token(&env));
+
+        let ab = factory.create_pair(&admin, &a, &b, &8_000);
+        let ac = factory.create_pair(&admin, &a, &c, &8_000);
+        let ba = factory.create_pair(&admin, &b, &a, &8_000);
+
+        // Same tokens in a different role, or a different counterpart, is a different market.
+        assert_ne!(ab.pair_id, ac.pair_id);
+        assert_ne!(ab.pair_id, ba.pair_id);
+        assert!(matches!(
+            factory.try_create_pair(&admin, &a, &b, &8_000),
+            Err(Ok(IsolatedLendingError::PairAlreadyExists))
+        ));
     }
 }
