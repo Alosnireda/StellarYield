@@ -270,6 +270,36 @@ describe("Treasury withdrawal cooldown routes", () => {
     expect(typeof res.body.data.cooldownUntil).toBe("string");
   });
 
+  it("round-trips special characters in a vault withdrawal memo through JSON", async () => {
+    const memo = 'Rebalance "blend" \\\\ USDC\nreviewed by ops — λ';
+
+    const created = await request(app)
+      .post("/api/treasury/withdrawals")
+      .set(admin)
+      .send({ vaultId: "blend", amountUsd: 50_000, memo })
+      .expect(201);
+
+    expect(created.body.data.memo).toBe(memo);
+
+    const listed = await request(app)
+      .get("/api/treasury/withdrawals")
+      .set(admin)
+      .expect(200);
+
+    expect(listed.body.data).toHaveLength(1);
+    expect(listed.body.data[0].memo).toBe(memo);
+  });
+
+  it("serializes an omitted vault withdrawal memo as null", async () => {
+    const res = await request(app)
+      .post("/api/treasury/withdrawals")
+      .set(admin)
+      .send({ vaultId: "blend", amountUsd: 50_000 })
+      .expect(201);
+
+    expect(res.body.data.memo).toBeNull();
+  });
+
   it("POST /withdrawals returns 409 COOLDOWN_ACTIVE during cooldown", async () => {
     await request(app)
       .post("/api/treasury/withdrawals")
