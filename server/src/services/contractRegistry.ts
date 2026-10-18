@@ -11,6 +11,7 @@
 
 import * as path from "path";
 import * as fs from "fs";
+import { createHash } from "crypto";
 
 export type ContractName =
   | "vault"
@@ -61,6 +62,42 @@ function assertSupportedNetwork(network: NetworkName): void {
 
 type Registry = Record<NetworkName, Record<ContractName, string>>;
 
+export type ContractRegistryChecksumErrorCode =
+  | "registry_checksum_unavailable"
+  | "registry_checksum_invalid"
+  | "registry_checksum_mismatch";
+
+export class ContractRegistryChecksumError extends Error {
+  public readonly code: ContractRegistryChecksumErrorCode;
+
+  constructor(code: ContractRegistryChecksumErrorCode, message: string) {
+    super(message);
+    this.name = "ContractRegistryChecksumError";
+    this.code = code;
+  }
+}
+
+export function verifyContractRegistryChecksum(
+  registryContents: Uint8Array,
+  expectedChecksum: string,
+): void {
+  const expected = expectedChecksum.trim();
+  if (!/^[a-f0-9]{64}$/.test(expected)) {
+    throw new ContractRegistryChecksumError(
+      "registry_checksum_invalid",
+      "Contract registry checksum is missing or invalid",
+    );
+  }
+
+  const actual = createHash("sha256").update(registryContents).digest("hex");
+  if (actual !== expected) {
+    throw new ContractRegistryChecksumError(
+      "registry_checksum_mismatch",
+      "Contract registry checksum verification failed",
+    );
+  }
+}
+
 // ── Safe Fallback Registry ────────────────────────────────────────────────
 /**
  * Deterministic fallback record used when the primary registry file cannot
@@ -104,13 +141,17 @@ export function getRegistryLoadState(): RegistryLoadState {
 
 const REGISTRY_PATH = path.resolve(
   __dirname,
-  "../../../../contracts/registry.json",
+  "../../../contracts/registry.json",
+);
+const REGISTRY_CHECKSUM_PATH = path.resolve(
+  __dirname,
+  "../../../contracts/registry.sha256",
 );
 
 function loadRegistry(): Registry {
-  let raw: string;
+  let registryContents: Buffer;
   try {
-    raw = fs.readFileSync(REGISTRY_PATH, "utf8");
+    registryContents = fs.readFileSync(REGISTRY_PATH);
   } catch (err: unknown) {
     const code = (err as NodeJS.ErrnoException).code ?? "UNKNOWN";
     const message = (err as Error).message ?? String(err);
@@ -123,9 +164,21 @@ function loadRegistry(): Registry {
     return { ...SAFE_FALLBACK_REGISTRY };
   }
 
+  let expectedChecksum: string;
+  try {
+    expectedChecksum = fs.readFileSync(REGISTRY_CHECKSUM_PATH, "utf8");
+  } catch {
+    throw new ContractRegistryChecksumError(
+      "registry_checksum_unavailable",
+      "Contract registry checksum file could not be read",
+    );
+  }
+
+  verifyContractRegistryChecksum(registryContents, expectedChecksum);
+
   let parsed: unknown;
   try {
-    parsed = JSON.parse(raw);
+    parsed = JSON.parse(registryContents.toString("utf8"));
   } catch (err: unknown) {
     const reason = `Registry file contains malformed JSON: ${(err as Error).message}`;
     console.warn(`[contractRegistry] ${reason} — using safe fallback`);

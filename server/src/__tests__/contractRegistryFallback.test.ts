@@ -11,7 +11,15 @@
  *   - getRegistryLoadState returns ok after successful load
  */
 
-import { getRegistryLoadState, getContractId, getAllContractIds, type RegistryLoadState } from '../services/contractRegistry';
+import { createHash } from "crypto";
+import {
+  ContractRegistryChecksumError,
+  getRegistryLoadState,
+  getContractId,
+  getAllContractIds,
+  verifyContractRegistryChecksum,
+  type RegistryLoadState,
+} from '../services/contractRegistry';
 
 describe('contractRegistry fallback', () => {
   it('getRegistryLoadState returns an object with expected shape', () => {
@@ -69,5 +77,34 @@ describe('RegistryLoadState', () => {
     if (state.status === 'ok') {
       expect(state.reason).toBeNull();
     }
+  });
+});
+
+describe('Contract registry checksum verification', () => {
+  const contents = Buffer.from('{"testnet":{}}', 'utf8');
+  const checksum = createHash('sha256').update(contents).digest('hex');
+
+  it('accepts the expected SHA-256 digest', () => {
+    expect(() => verifyContractRegistryChecksum(contents, `${checksum}\n`)).not.toThrow();
+  });
+
+  it('rejects a registry whose contents do not match the expected digest', () => {
+    let thrown: unknown;
+    try {
+      verifyContractRegistryChecksum(contents, '0'.repeat(64));
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(ContractRegistryChecksumError);
+    expect(thrown).toMatchObject({
+      code: 'registry_checksum_mismatch',
+      message: 'Contract registry checksum verification failed',
+    });
+  });
+
+  it('rejects a malformed expected digest with a stable error', () => {
+    expect(() => verifyContractRegistryChecksum(contents, 'invalid')).toThrow(
+      'Contract registry checksum is missing or invalid',
+    );
   });
 });
