@@ -459,9 +459,7 @@ const router = createBrowserRouter([
         path: "/rewards",
         element: (
           <RouteBoundary>
-            <RequireOnboarding require="wallet">
-              <ClaimRewards />
-            </RequireOnboarding>
+            <ClaimRewards />
           </RouteBoundary>
         ),
       },

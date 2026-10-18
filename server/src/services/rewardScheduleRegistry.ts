@@ -17,6 +17,15 @@ export interface RewardScheduleWindow {
   endDate: Date;
 }
 
+export interface RewardCampaignCalendarEntry {
+  protocolName: string;
+  tokenSymbol: string;
+  dailyEmission: number;
+  startDate: string;
+  endDate: string;
+  isActive: boolean;
+}
+
 /**
  * Typed error raised when publishing a reward schedule would overlap an
  * existing active schedule window for the same protocol + token.
@@ -81,6 +90,52 @@ export function findOverlappingSchedule(
 }
 
 export class RewardScheduleRegistry {
+  static async getCampaignCalendar(): Promise<RewardCampaignCalendarEntry[]> {
+    const mongoose = require("mongoose");
+    if (!mongoose.connection || mongoose.connection.readyState !== 1) {
+      throw new Error("Reward campaign schedule storage is unavailable.");
+    }
+
+    const schedules = await RewardScheduleModel.find({}).lean();
+    return schedules.map((schedule: {
+      protocolName: string;
+      tokenSymbol: string;
+      dailyEmission: number;
+      startDate: Date;
+      endDate: Date;
+      isActive: boolean;
+    }) => {
+      const startDate = new Date(schedule.startDate);
+      const endDate = new Date(schedule.endDate);
+      if (
+        typeof schedule.protocolName !== "string" ||
+        !schedule.protocolName.trim() ||
+        typeof schedule.tokenSymbol !== "string" ||
+        !schedule.tokenSymbol.trim() ||
+        typeof schedule.dailyEmission !== "number" ||
+        !Number.isFinite(schedule.dailyEmission) ||
+        typeof schedule.isActive !== "boolean" ||
+        !Number.isFinite(startDate.getTime()) ||
+        !Number.isFinite(endDate.getTime())
+      ) {
+        throw new Error("Reward campaign schedule contains invalid dates.");
+      }
+
+      return {
+        protocolName: schedule.protocolName,
+        tokenSymbol: schedule.tokenSymbol,
+        dailyEmission: schedule.dailyEmission,
+        startDate: startDate.toISOString(),
+        endDate: endDate.toISOString(),
+        isActive: schedule.isActive,
+      };
+    }).sort((left, right) =>
+      left.startDate.localeCompare(right.startDate) ||
+      left.protocolName.localeCompare(right.protocolName) ||
+      left.tokenSymbol.localeCompare(right.tokenSymbol),
+    );
+  }
+
   /**
    * Registers or updates a reward schedule.
    * Unknown or incomplete schedules are marked as low confidence by default.
