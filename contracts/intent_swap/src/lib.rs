@@ -19,7 +19,7 @@
 //! - Intents have expiry timestamps and minimum output guarantees
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env,
+    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, BytesN, Env,
 };
 
 // ── Storage Keys ────────────────────────────────────────────────────────
@@ -39,9 +39,21 @@ pub enum DataKey {
     FeeRecipient,
     SolverCount,
     Nonce(Address, u64),
+    MaxQuoteAge,
 }
 
 // ── Data Structures ─────────────────────────────────────────────────────
+
+/// Signature domain of an intent: the network and the deployment it is
+/// valid on. The owner signs it as a `create_intent` argument, so a signed
+/// intent cannot be replayed on another network or another deployment.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IntentDomain {
+    /// SHA-256 of the network passphrase.
+    pub network_id: BytesN<32>,
+    pub verifying_contract: Address,
+}
 
 /// Lifecycle of an owner-scoped intent nonce. Absent means unused.
 #[contracttype]
@@ -136,9 +148,15 @@ pub enum SwapError {
     InvalidFee = 15,
     NonceUsed = 16,
     FeeCapExceeded = 17,
+    DomainMismatch = 18,
+    QuoteExpired = 19,
+    QuoteFromFuture = 20,
 }
 
 const MAX_PROTOCOL_FEE_BPS: u32 = 100;
+/// Seconds a solver quote stays settleable when the admin has not set a
+/// window: about six ledgers at Stellar's ~5 s close time.
+const DEFAULT_MAX_QUOTE_AGE_SECS: u64 = 30;
 
 // ── Contract ────────────────────────────────────────────────────────────
 
@@ -207,6 +225,7 @@ impl IntentSwap {
     /// * `expiry` — Ledger timestamp after which the intent expires
     /// * `partial_fill` — Whether partial fills are allowed
     /// * `nonce` — Owner-scoped single-use nonce; cancellable via `cancel_nonce`
+    /// * `domain` — Signed network and deployment; must equal `get_domain()`
     ///
     /// # Returns
     /// The intent ID
@@ -221,10 +240,14 @@ impl IntentSwap {
         expiry: u64,
         partial_fill: bool,
         nonce: u64,
+        domain: IntentDomain,
     ) -> Result<u64, SwapError> {
         Self::require_init(&env)?;
         owner.require_auth();
 
+        if domain != Self::get_domain(env.clone()) {
+            return Err(SwapError::DomainMismatch);
+        }
         if sell_amount <= 0 || min_buy_amount <= 0 {
             return Err(SwapError::ZeroAmount);
         }
@@ -358,10 +381,14 @@ impl IntentSwap {
     /// A registered solver fills an open intent by providing buy tokens
     /// and receiving the escrowed sell tokens.
     ///
-    /// The solver must provide at least `min_buy_amount` of buy tokens.
     /// The protocol fee and the solver fee are deducted from the buy tokens
     /// before delivery; their sum is verified against the owner-signed
-    /// `max_fee` (pro-rated for partial fills) before any transfer.
+    /// `max_fee` (pro-rated for partial fills) before any transfer. The
+    /// owner's net output, summed over every fill of the intent, must reach
+    /// `min_buy_amount` pro-rated to the sell amount filled so far.
+    ///
+    /// The quote is settleable while `quoted_at <= now <= quoted_at +
+    /// max_quote_age`, where `now` is the ledger close time.
     ///
     /// Settlement is atomic: if any leg fails, the host reverts every prior
     /// leg, all state writes, and the receipt, leaving the escrow reserved
@@ -373,6 +400,7 @@ impl IntentSwap {
     /// * `buy_amount` — Amount of buy tokens the solver provides
     /// * `sell_amount` — Amount of sell tokens the solver wants (for partial fills)
     /// * `solver_fee` — Buy tokens the solver retains from `buy_amount`
+    /// * `quoted_at` — Ledger timestamp at which the solver priced the quote
     pub fn fill_intent(
         env: Env,
         solver: Address,
@@ -380,6 +408,7 @@ impl IntentSwap {
         buy_amount: i128,
         sell_amount: i128,
         solver_fee: i128,
+        quoted_at: u64,
     ) -> Result<(), SwapError> {
         Self::require_init(&env)?;
         solver.require_auth();
@@ -405,6 +434,12 @@ impl IntentSwap {
         if now >= intent.expiry {
             return Err(SwapError::IntentExpired);
         }
+        if quoted_at > now {
+            return Err(SwapError::QuoteFromFuture);
+        }
+        if now - quoted_at > Self::get_max_quote_age(env.clone()) {
+            return Err(SwapError::QuoteExpired);
+        }
 
         // Prevent self-trading
         if solver == intent.owner {
@@ -422,10 +457,6 @@ impl IntentSwap {
             remaining_sell
         };
 
-        if buy_amount < Self::fill_share(&intent, intent.min_buy_amount, fill_sell) {
-            return Err(SwapError::InsufficientOutput);
-        }
-
         // Verify actual fees against the owner-signed cap before any transfer
         if solver_fee < 0 {
             return Err(SwapError::InvalidFee);
@@ -441,6 +472,13 @@ impl IntentSwap {
             return Err(SwapError::FeeCapExceeded);
         }
         let user_receives = buy_amount - protocol_fee - solver_fee;
+
+        // The signed minimum binds net output across all fills, so per-fill
+        // rounding can never settle the intent below `min_buy_amount`.
+        let min_net = Self::min_cumulative_output(&intent, intent.filled_sell + fill_sell);
+        if user_receives < 0 || intent.filled_buy + user_receives < min_net {
+            return Err(SwapError::InsufficientOutput);
+        }
 
         // Transfer buy tokens from solver to user
         let buy_client = token::Client::new(&env, &intent.buy_token);
@@ -560,7 +598,34 @@ impl IntentSwap {
         Ok(())
     }
 
+    /// Update the oldest a solver quote may be at settlement, in seconds.
+    /// Admin only.
+    pub fn set_max_quote_age(env: Env, admin: Address, max_age_secs: u64) -> Result<(), SwapError> {
+        Self::require_admin(&env, &admin)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::MaxQuoteAge, &max_age_secs);
+        env.events()
+            .publish((symbol_short!("quote_age"),), (max_age_secs,));
+        Ok(())
+    }
+
     // ── View Functions ──────────────────────────────────────────────
+
+    /// The domain an intent must sign to be accepted by this deployment.
+    pub fn get_domain(env: Env) -> IntentDomain {
+        IntentDomain {
+            network_id: env.ledger().network_id(),
+            verifying_contract: env.current_contract_address(),
+        }
+    }
+
+    pub fn get_max_quote_age(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::MaxQuoteAge)
+            .unwrap_or(DEFAULT_MAX_QUOTE_AGE_SECS)
+    }
 
     pub fn get_intent(env: Env, intent_id: u64) -> Result<SwapIntent, SwapError> {
         env.storage()
@@ -746,6 +811,21 @@ impl IntentSwap {
         }
     }
 
+    /// Least cumulative net output owed once `filled_sell` has been sold:
+    /// `min_buy_amount` pro-rated and rounded up (exact on completion).
+    fn min_cumulative_output(intent: &SwapIntent, filled_sell: i128) -> i128 {
+        if filled_sell == intent.sell_amount {
+            return intent.min_buy_amount;
+        }
+        let scaled = intent.min_buy_amount * filled_sell;
+        let min_net = scaled / intent.sell_amount;
+        if scaled % intent.sell_amount == 0 {
+            min_net
+        } else {
+            min_net + 1
+        }
+    }
+
     /// Close an open intent and return its remaining escrow to the owner.
     fn close_and_refund(env: &Env, intent: &mut SwapIntent, status: IntentStatus) {
         intent.status = status;
@@ -767,7 +847,7 @@ impl IntentSwap {
 mod tests {
     use super::*;
     use soroban_sdk::testutils::{Address as _, Events as _, IssuerFlags, Ledger};
-    use soroban_sdk::{Env, Symbol, TryFromVal};
+    use soroban_sdk::{Bytes, Env, Symbol, TryFromVal};
 
     fn setup_env() -> (
         Env,
@@ -867,10 +947,16 @@ mod tests {
         env.ledger().set_timestamp(100);
 
         let intent_id = client.create_intent(
-            &user, &token_a, &token_b, &10_000, &9_500, // min 9500 buy tokens
+            &user,
+            &token_a,
+            &token_b,
+            &10_000,
+            &9_500, // min 9500 buy tokens
             &100,   // max combined fee
             &200,   // expires at ledger 200
-            &false, &1,
+            &false,
+            &1,
+            &client.get_domain(),
         );
 
         assert_eq!(intent_id, 1);
@@ -889,7 +975,16 @@ mod tests {
 
         env.ledger().set_timestamp(100);
         let intent_id = client.create_intent(
-            &user, &token_a, &token_b, &10_000, &9_500, &100, &200, &false, &1,
+            &user,
+            &token_a,
+            &token_b,
+            &10_000,
+            &9_500,
+            &100,
+            &200,
+            &false,
+            &1,
+            &client.get_domain(),
         );
 
         client.cancel_intent(&user, &intent_id);
@@ -920,11 +1015,20 @@ mod tests {
 
         // Create intent
         let intent_id = client.create_intent(
-            &user, &token_a, &token_b, &10_000, &9_500, &100, &200, &false, &1,
+            &user,
+            &token_a,
+            &token_b,
+            &10_000,
+            &9_500,
+            &100,
+            &200,
+            &false,
+            &1,
+            &client.get_domain(),
         );
 
         // Fill intent — solver provides 10_000 buy tokens
-        client.fill_intent(&solver_addr, &intent_id, &10_000, &10_000, &0);
+        client.fill_intent(&solver_addr, &intent_id, &10_000, &10_000, &0, &100);
 
         let intent = client.get_intent(&intent_id);
         assert_eq!(intent.status, IntentStatus::Filled);
@@ -951,11 +1055,20 @@ mod tests {
 
         // Create intent with partial fill enabled
         let intent_id = client.create_intent(
-            &user, &token_a, &token_b, &10_000, &9_500, &100, &200, &true, &1,
+            &user,
+            &token_a,
+            &token_b,
+            &10_000,
+            &9_500,
+            &100,
+            &200,
+            &true,
+            &1,
+            &client.get_domain(),
         );
 
         // Partial fill — only 5000 of 10000
-        client.fill_intent(&solver_addr, &intent_id, &5_000, &5_000, &0);
+        client.fill_intent(&solver_addr, &intent_id, &5_000, &5_000, &0, &100);
 
         let intent = client.get_intent(&intent_id);
         assert_eq!(intent.status, IntentStatus::Open); // Still open
@@ -977,11 +1090,20 @@ mod tests {
 
         client.register_solver(&solver_addr, &token_a, &1_000);
         let intent_id = client.create_intent(
-            &user, &token_a, &token_b, &10_000, &9_500, &100, &200, &false, &1,
+            &user,
+            &token_a,
+            &token_b,
+            &10_000,
+            &9_500,
+            &100,
+            &200,
+            &false,
+            &1,
+            &client.get_domain(),
         );
 
         // Try to fill with less than min_buy_amount
-        client.fill_intent(&solver_addr, &intent_id, &5_000, &10_000, &0);
+        client.fill_intent(&solver_addr, &intent_id, &5_000, &10_000, &0, &100);
     }
 
     #[test]
@@ -993,7 +1115,16 @@ mod tests {
 
         env.ledger().set_timestamp(100);
         let intent_id = client.create_intent(
-            &user, &token_a, &token_b, &10_000, &9_500, &100, &200, &false, &1,
+            &user,
+            &token_a,
+            &token_b,
+            &10_000,
+            &9_500,
+            &100,
+            &200,
+            &false,
+            &1,
+            &client.get_domain(),
         );
 
         // Advance time past expiry
@@ -1020,11 +1151,20 @@ mod tests {
 
         env.ledger().set_timestamp(100);
         let intent_id = client.create_intent(
-            &user, &token_a, &token_b, &10_000, &9_500, &100, &200, &false, &1,
+            &user,
+            &token_a,
+            &token_b,
+            &10_000,
+            &9_500,
+            &100,
+            &200,
+            &false,
+            &1,
+            &client.get_domain(),
         );
 
         // Non-registered solver tries to fill
-        client.fill_intent(&rando, &intent_id, &10_000, &10_000, &0);
+        client.fill_intent(&rando, &intent_id, &10_000, &10_000, &0, &100);
     }
 
     #[test]
@@ -1086,6 +1226,7 @@ mod tests {
             &200,
             &partial_fill,
             &1,
+            &client.get_domain(),
         );
         (owner, intent_id)
     }
@@ -1153,7 +1294,7 @@ mod tests {
         );
         assert_eq!(token::Client::new(&env, &token_a).balance(&owner), 10_000);
         assert_eq!(
-            client.try_fill_intent(&solver, &intent_id, &10_000, &10_000, &0),
+            client.try_fill_intent(&solver, &intent_id, &10_000, &10_000, &0, &100),
             Err(Ok(SwapError::IntentNotOpen))
         );
         assert_eq!(
@@ -1169,12 +1310,21 @@ mod tests {
         let (owner, intent_id) = open_intent(&env, &client, &token_a, &token_b, 100, false);
         mint_tokens(&env, &token_a, &owner, 10_000);
 
-        client.fill_intent(&solver, &intent_id, &10_000, &10_000, &0);
+        client.fill_intent(&solver, &intent_id, &10_000, &10_000, &0, &100);
 
         // A consumed nonce can neither back a new intent nor be cancelled
         assert_eq!(
             client.try_create_intent(
-                &owner, &token_a, &token_b, &10_000, &9_500, &100, &200, &false, &1
+                &owner,
+                &token_a,
+                &token_b,
+                &10_000,
+                &9_500,
+                &100,
+                &200,
+                &false,
+                &1,
+                &client.get_domain()
             ),
             Err(Ok(SwapError::NonceUsed))
         );
@@ -1187,7 +1337,16 @@ mod tests {
         client.cancel_nonce(&owner, &7);
         assert_eq!(
             client.try_create_intent(
-                &owner, &token_a, &token_b, &10_000, &9_500, &100, &200, &false, &7
+                &owner,
+                &token_a,
+                &token_b,
+                &10_000,
+                &9_500,
+                &100,
+                &200,
+                &false,
+                &7,
+                &client.get_domain()
             ),
             Err(Ok(SwapError::NonceUsed))
         );
@@ -1201,13 +1360,22 @@ mod tests {
         let (owner, first_id) = open_intent(&env, &client, &token_a, &token_b, 100, false);
         mint_tokens(&env, &token_a, &owner, 10_000);
         let second_id = client.create_intent(
-            &owner, &token_a, &token_b, &10_000, &9_500, &100, &200, &false, &2,
+            &owner,
+            &token_a,
+            &token_b,
+            &10_000,
+            &9_500,
+            &100,
+            &200,
+            &false,
+            &2,
+            &client.get_domain(),
         );
 
         client.cancel_nonce(&owner, &1);
 
         // Nonce 2 of the same owner is unaffected
-        client.fill_intent(&solver, &second_id, &10_000, &10_000, &0);
+        client.fill_intent(&solver, &second_id, &10_000, &10_000, &0, &100);
         assert_eq!(client.get_intent(&first_id).status, IntentStatus::Cancelled);
         assert_eq!(client.get_intent(&second_id).status, IntentStatus::Filled);
 
@@ -1227,13 +1395,13 @@ mod tests {
         // Admin raises the fee after signing: 51 > signed cap of 50
         client.set_protocol_fee(&admin, &51);
         assert_eq!(
-            client.try_fill_intent(&solver, &intent_id, &10_000, &10_000, &0),
+            client.try_fill_intent(&solver, &intent_id, &10_000, &10_000, &0, &100),
             Err(Ok(SwapError::FeeCapExceeded))
         );
 
         // Exactly at the cap settles
         client.set_protocol_fee(&admin, &50);
-        client.fill_intent(&solver, &intent_id, &10_000, &10_000, &0);
+        client.fill_intent(&solver, &intent_id, &10_000, &10_000, &0, &100);
         assert_eq!(token::Client::new(&env, &token_b).balance(&owner), 9_950);
     }
 
@@ -1246,12 +1414,12 @@ mod tests {
 
         for solver_fee in [101, i128::MAX] {
             assert_eq!(
-                client.try_fill_intent(&solver, &intent_id, &10_000, &10_000, &solver_fee),
+                client.try_fill_intent(&solver, &intent_id, &10_000, &10_000, &solver_fee, &100),
                 Err(Ok(SwapError::FeeCapExceeded))
             );
         }
 
-        client.fill_intent(&solver, &intent_id, &10_000, &10_000, &100);
+        client.fill_intent(&solver, &intent_id, &10_000, &10_000, &100, &100);
         let buy = token::Client::new(&env, &token_b);
         assert_eq!(buy.balance(&owner), 9_900);
         // Solver retains its fee: pays only 9_900 out of 20_000
@@ -1266,11 +1434,11 @@ mod tests {
 
         // protocol 50 and solver 51 each fit the cap of 100; their sum does not
         assert_eq!(
-            client.try_fill_intent(&solver, &intent_id, &10_000, &10_000, &51),
+            client.try_fill_intent(&solver, &intent_id, &10_000, &10_000, &51, &100),
             Err(Ok(SwapError::FeeCapExceeded))
         );
 
-        client.fill_intent(&solver, &intent_id, &10_000, &10_000, &50);
+        client.fill_intent(&solver, &intent_id, &10_000, &10_000, &50, &100);
         let buy = token::Client::new(&env, &token_b);
         assert_eq!(buy.balance(&owner), 9_900);
         assert_eq!(buy.balance(&solver), 20_000 - 9_900 - 50);
@@ -1284,10 +1452,10 @@ mod tests {
 
         // Half fill → cap 50; protocol 25 + solver 26 = 51
         assert_eq!(
-            client.try_fill_intent(&solver, &intent_id, &5_000, &5_000, &26),
+            client.try_fill_intent(&solver, &intent_id, &5_000, &5_000, &26, &100),
             Err(Ok(SwapError::FeeCapExceeded))
         );
-        client.fill_intent(&solver, &intent_id, &5_000, &5_000, &25);
+        client.fill_intent(&solver, &intent_id, &5_000, &5_000, &25, &100);
         assert_eq!(client.get_intent(&intent_id).filled_buy, 4_950);
     }
 
@@ -1302,17 +1470,35 @@ mod tests {
         for max_fee in [-1, 9_500] {
             assert_eq!(
                 client.try_create_intent(
-                    &owner, &token_a, &token_b, &10_000, &9_500, &max_fee, &200, &false, &1
+                    &owner,
+                    &token_a,
+                    &token_b,
+                    &10_000,
+                    &9_500,
+                    &max_fee,
+                    &200,
+                    &false,
+                    &1,
+                    &client.get_domain()
                 ),
                 Err(Ok(SwapError::InvalidFee))
             );
         }
 
         let intent_id = client.create_intent(
-            &owner, &token_a, &token_b, &10_000, &9_500, &100, &200, &false, &1,
+            &owner,
+            &token_a,
+            &token_b,
+            &10_000,
+            &9_500,
+            &100,
+            &200,
+            &false,
+            &1,
+            &client.get_domain(),
         );
         assert_eq!(
-            client.try_fill_intent(&solver, &intent_id, &10_000, &10_000, &-1),
+            client.try_fill_intent(&solver, &intent_id, &10_000, &10_000, &-1, &100),
             Err(Ok(SwapError::InvalidFee))
         );
     }
@@ -1325,7 +1511,7 @@ mod tests {
         let solver = funded_solver(&env, &client, &token_a, &token_b, 20_000);
         let (_, intent_id) = open_intent(&env, &client, &token_a, &token_b, 100, false);
 
-        client.fill_intent(&solver, &intent_id, &10_000, &10_000, &20);
+        client.fill_intent(&solver, &intent_id, &10_000, &10_000, &20, &100);
 
         let receipts = receipts(&env);
         assert_eq!(receipts.len(), 1);
@@ -1351,7 +1537,7 @@ mod tests {
         let (_, intent_id) = open_intent(&env, &client, &token_a, &token_b, 100, true);
 
         for fill_index in 1..=2u32 {
-            client.fill_intent(&solver, &intent_id, &5_000, &5_000, &0);
+            client.fill_intent(&solver, &intent_id, &5_000, &5_000, &0, &100);
             let receipts = receipts(&env);
             assert_eq!(receipts.len(), 1);
             assert_eq!(receipts.get_unchecked(0).fill_index, fill_index);
@@ -1366,7 +1552,7 @@ mod tests {
         let (_, intent_id) = open_intent(&env, &client, &token_a, &token_b, 100, false);
 
         assert_eq!(
-            client.try_fill_intent(&solver, &intent_id, &10_000, &10_000, &51),
+            client.try_fill_intent(&solver, &intent_id, &10_000, &10_000, &51, &100),
             Err(Ok(SwapError::FeeCapExceeded))
         );
         assert_rolled_back_and_refundable(&env, &client, intent_id, &token_b, &solver, 20_000);
@@ -1387,7 +1573,7 @@ mod tests {
         let (_, intent_id) = open_intent(&env, &client, &token_a, &token_b, 100, false);
 
         let err = client
-            .try_fill_intent(&solver, &intent_id, &10_000, &10_000, &0)
+            .try_fill_intent(&solver, &intent_id, &10_000, &10_000, &0, &100)
             .unwrap_err()
             .unwrap();
         assert_eq!(err as u32, SAC_BALANCE_ERROR);
@@ -1402,7 +1588,7 @@ mod tests {
         let (_, intent_id) = open_intent(&env, &client, &token_a, &token_b, 100, false);
 
         let err = client
-            .try_fill_intent(&solver, &intent_id, &10_000, &10_000, &0)
+            .try_fill_intent(&solver, &intent_id, &10_000, &10_000, &0, &100)
             .unwrap_err()
             .unwrap();
         assert_eq!(err as u32, SAC_BALANCE_ERROR);
@@ -1425,7 +1611,7 @@ mod tests {
             .set_authorized(&solver, &false);
 
         let err = client
-            .try_fill_intent(&solver, &intent_id, &10_000, &10_000, &0)
+            .try_fill_intent(&solver, &intent_id, &10_000, &10_000, &0, &100)
             .unwrap_err()
             .unwrap();
         assert_eq!(err as u32, SAC_BALANCE_DEAUTHORIZED_ERROR);
@@ -1441,7 +1627,7 @@ mod tests {
 
         env.ledger().set_timestamp(200);
         assert_eq!(
-            client.try_fill_intent(&solver, &intent_id, &10_000, &10_000, &0),
+            client.try_fill_intent(&solver, &intent_id, &10_000, &10_000, &0, &100),
             Err(Ok(SwapError::IntentExpired))
         );
         assert_eq!(client.get_intent(&intent_id).status, IntentStatus::Open);
@@ -1449,5 +1635,231 @@ mod tests {
         client.expire_intent(&intent_id);
         assert_eq!(client.get_intent(&intent_id).status, IntentStatus::Expired);
         assert_eq!(token::Client::new(&env, &token_a).balance(&owner), 10_000);
+    }
+
+    // ── #1488 Network-bound signature domain ─────────────────────────────
+
+    const PUBNET: &str = "Public Global Stellar Network ; September 2015";
+    const TESTNET: &str = "Test SDF Network ; September 2015";
+
+    fn network_id(env: &Env, passphrase: &str) -> BytesN<32> {
+        env.crypto()
+            .sha256(&Bytes::from_slice(env, passphrase.as_bytes()))
+            .to_bytes()
+    }
+
+    #[test]
+    fn test_intent_signed_for_current_network_is_accepted() {
+        let (env, client, _, _, token_a, token_b, contract_id) = setup_env();
+        env.ledger()
+            .set_network_id(network_id(&env, PUBNET).to_array());
+        let owner = Address::generate(&env);
+        mint_tokens(&env, &token_a, &owner, 10_000);
+        env.ledger().set_timestamp(100);
+
+        let domain = IntentDomain {
+            network_id: network_id(&env, PUBNET),
+            verifying_contract: contract_id,
+        };
+        assert_eq!(client.get_domain(), domain);
+        let intent_id = client.create_intent(
+            &owner, &token_a, &token_b, &10_000, &9_500, &100, &200, &false, &1, &domain,
+        );
+        assert_eq!(client.get_intent(&intent_id).status, IntentStatus::Open);
+    }
+
+    #[test]
+    fn test_cross_network_replay_rejected() {
+        let (env, client, _, _, token_a, token_b, contract_id) = setup_env();
+        env.ledger()
+            .set_network_id(network_id(&env, PUBNET).to_array());
+        let owner = Address::generate(&env);
+        mint_tokens(&env, &token_a, &owner, 10_000);
+        env.ledger().set_timestamp(100);
+
+        let testnet_intent = IntentDomain {
+            network_id: network_id(&env, TESTNET),
+            verifying_contract: contract_id,
+        };
+        let other_deployment = IntentDomain {
+            network_id: network_id(&env, PUBNET),
+            verifying_contract: env.register(IntentSwap, ()),
+        };
+        for domain in [testnet_intent, other_deployment] {
+            assert_eq!(
+                client.try_create_intent(
+                    &owner, &token_a, &token_b, &10_000, &9_500, &100, &200, &false, &1, &domain
+                ),
+                Err(Ok(SwapError::DomainMismatch))
+            );
+        }
+
+        // Rejected before escrow and nonce use
+        assert_eq!(token::Client::new(&env, &token_a).balance(&owner), 10_000);
+        client.create_intent(
+            &owner,
+            &token_a,
+            &token_b,
+            &10_000,
+            &9_500,
+            &100,
+            &200,
+            &false,
+            &1,
+            &client.get_domain(),
+        );
+    }
+
+    // ── #1489 Solver quote freshness ─────────────────────────────────────
+
+    #[test]
+    fn test_quote_settles_up_to_max_age_inclusive() {
+        let (env, client, _, _, token_a, token_b, _) = setup_env();
+        let solver = funded_solver(&env, &client, &token_a, &token_b, 20_000);
+        let (_, intent_id) = open_intent(&env, &client, &token_a, &token_b, 100, false);
+
+        // Ledger time 100: a quote from 70 is exactly the default 30 s old
+        assert_eq!(client.get_max_quote_age(), 30);
+        client.fill_intent(&solver, &intent_id, &10_000, &10_000, &0, &70);
+        assert_eq!(client.get_intent(&intent_id).status, IntentStatus::Filled);
+    }
+
+    #[test]
+    fn test_expired_quote_rejected() {
+        let (env, client, _, _, token_a, token_b, _) = setup_env();
+        let solver = funded_solver(&env, &client, &token_a, &token_b, 20_000);
+        let (_, intent_id) = open_intent(&env, &client, &token_a, &token_b, 100, false);
+
+        assert_eq!(
+            client.try_fill_intent(&solver, &intent_id, &10_000, &10_000, &0, &69),
+            Err(Ok(SwapError::QuoteExpired))
+        );
+        assert_rolled_back_and_refundable(&env, &client, intent_id, &token_b, &solver, 20_000);
+    }
+
+    #[test]
+    fn test_future_dated_quote_rejected() {
+        let (env, client, _, _, token_a, token_b, _) = setup_env();
+        let solver = funded_solver(&env, &client, &token_a, &token_b, 20_000);
+        let (_, intent_id) = open_intent(&env, &client, &token_a, &token_b, 100, false);
+
+        assert_eq!(
+            client.try_fill_intent(&solver, &intent_id, &10_000, &10_000, &0, &101),
+            Err(Ok(SwapError::QuoteFromFuture))
+        );
+        assert_rolled_back_and_refundable(&env, &client, intent_id, &token_b, &solver, 20_000);
+    }
+
+    #[test]
+    fn test_admin_sets_max_quote_age() {
+        let (env, client, admin, _, token_a, token_b, _) = setup_env();
+        let solver = funded_solver(&env, &client, &token_a, &token_b, 20_000);
+        let (_, intent_id) = open_intent(&env, &client, &token_a, &token_b, 100, false);
+
+        let outsider = Address::generate(&env);
+        assert_eq!(
+            client.try_set_max_quote_age(&outsider, &0),
+            Err(Ok(SwapError::Unauthorized))
+        );
+
+        // Zero admits only quotes priced at the settling ledger's close time
+        client.set_max_quote_age(&admin, &0);
+        assert_eq!(client.get_max_quote_age(), 0);
+        assert_eq!(
+            client.try_fill_intent(&solver, &intent_id, &10_000, &10_000, &0, &99),
+            Err(Ok(SwapError::QuoteExpired))
+        );
+        client.fill_intent(&solver, &intent_id, &10_000, &10_000, &0, &100);
+    }
+
+    // ── #1490 Net minimum across fills ───────────────────────────────────
+
+    #[test]
+    fn test_single_fill_net_output_must_reach_minimum() {
+        let (env, client, _, _, token_a, token_b, _) = setup_env();
+        let solver = funded_solver(&env, &client, &token_a, &token_b, 20_000);
+        let (owner, intent_id) = open_intent(&env, &client, &token_a, &token_b, 100, false);
+
+        // 50 bps protocol fee on each is 47. Gross 9_500 meets the minimum but
+        // nets 9_453; 9_546 nets 9_499; 9_548 less a solver fee of 2 nets 9_499.
+        for (buy_amount, solver_fee) in [(9_500, 0), (9_546, 0), (9_548, 2)] {
+            assert_eq!(
+                client.try_fill_intent(
+                    &solver,
+                    &intent_id,
+                    &buy_amount,
+                    &10_000,
+                    &solver_fee,
+                    &100
+                ),
+                Err(Ok(SwapError::InsufficientOutput))
+            );
+        }
+
+        client.fill_intent(&solver, &intent_id, &9_547, &10_000, &0, &100);
+        assert_eq!(token::Client::new(&env, &token_b).balance(&owner), 9_500);
+    }
+
+    #[test]
+    fn test_partial_fills_cannot_round_below_minimum_together() {
+        let (env, client, admin, _, token_a, token_b, _) = setup_env();
+        client.set_protocol_fee(&admin, &0);
+        let solver = funded_solver(&env, &client, &token_a, &token_b, 20_000);
+        let (owner, intent_id) = open_intent(&env, &client, &token_a, &token_b, 100, true);
+
+        // Legs of 3_333, 3_333 and 3_334 owe 3_166.35, 3_166.35 and 3_167.3.
+        // Flooring each would settle 9_499 in total; the cumulative minimum is
+        // rounded up, so the legs owe 3_167, 3_166 and 3_167.
+        for (fill_sell, owed) in [(3_333, 3_167), (3_333, 3_166), (3_334, 3_167)] {
+            // One unit short, by gross output or by the solver's fee
+            for (buy_amount, solver_fee) in [(owed - 1, 0), (owed + 1, 2)] {
+                assert_eq!(
+                    client.try_fill_intent(
+                        &solver,
+                        &intent_id,
+                        &buy_amount,
+                        &fill_sell,
+                        &solver_fee,
+                        &100
+                    ),
+                    Err(Ok(SwapError::InsufficientOutput))
+                );
+            }
+            client.fill_intent(&solver, &intent_id, &owed, &fill_sell, &0, &100);
+        }
+
+        let intent = client.get_intent(&intent_id);
+        assert_eq!(intent.status, IntentStatus::Filled);
+        assert_eq!(intent.filled_buy, 9_500);
+        assert_eq!(token::Client::new(&env, &token_b).balance(&owner), 9_500);
+    }
+
+    /// A buy token that accepts any transfer, as a non-SAC token may.
+    #[contract]
+    struct PermissiveToken;
+
+    #[contractimpl]
+    impl PermissiveToken {
+        pub fn transfer(_env: Env, _from: Address, _to: Address, _amount: i128) {}
+    }
+
+    #[test]
+    fn test_negative_net_leg_rejected_after_over_delivery() {
+        let (env, client, admin, _, token_a, _, _) = setup_env();
+        client.set_protocol_fee(&admin, &0);
+        let buy_token = env.register(PermissiveToken, ());
+        let solver = Address::generate(&env);
+        mint_tokens(&env, &token_a, &solver, 1_000);
+        client.register_solver(&solver, &token_a, &1_000);
+        let (_, intent_id) = open_intent(&env, &client, &token_a, &buy_token, 100, true);
+
+        // The first leg over-delivers, so the cumulative minimum alone would
+        // admit a later leg that pays the owner a negative amount.
+        client.fill_intent(&solver, &intent_id, &9_000, &5_000, &0, &100);
+        assert_eq!(
+            client.try_fill_intent(&solver, &intent_id, &-100, &1, &0, &100),
+            Err(Ok(SwapError::InsufficientOutput))
+        );
+        assert_eq!(client.get_intent(&intent_id).filled_sell, 5_000);
     }
 }

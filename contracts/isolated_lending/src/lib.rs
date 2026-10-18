@@ -45,6 +45,22 @@ pub struct OracleQuoteData {
     pub ledger: u32,
 }
 
+/// Health-factor components of a position, valued exactly as `liquidate`
+/// values them: it is liquidatable once
+/// `debt_value > collateral_value * threshold_bps / 10_000`.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HealthFactor {
+    /// Debt including interest accrued up to `ledger`, in debt-token units.
+    pub debt_value: i128,
+    /// Collateral at the collateral price, in debt-token units.
+    pub collateral_value: i128,
+    /// Collateral factor in bps; the liquidation threshold.
+    pub threshold_bps: u32,
+    /// Ledger sequence the components were calculated at.
+    pub ledger: u32,
+}
+
 #[contracttype]
 #[derive(Clone)]
 pub enum PairDataKey {
@@ -639,11 +655,7 @@ impl IsolatedLendingPair {
             .unwrap();
         let price_bps = Self::collateral_price_bps(&env) as i128;
 
-        let collateral_value = collateral
-            .checked_mul(price_bps)
-            .ok_or(IsolatedLendingError::MathOverflow)?
-            .checked_div(BPS_DENOMINATOR)
-            .ok_or(IsolatedLendingError::MathOverflow)?;
+        let collateral_value = Self::collateral_value(collateral, price_bps)?;
         let borrow_limit = collateral_value
             .checked_mul(collateral_factor_bps as i128)
             .ok_or(IsolatedLendingError::MathOverflow)?
@@ -931,6 +943,36 @@ impl IsolatedLendingPair {
         ))
     }
 
+    /// Health-factor components of `user`'s position for client previews.
+    /// Under an oracle policy, fails with the error `borrow` would raise when
+    /// the quote is missing, stale or below the required confidence.
+    pub fn get_health_factor(
+        env: Env,
+        user: Address,
+    ) -> Result<HealthFactor, IsolatedLendingError> {
+        Self::require_init(&env)?;
+        Self::check_oracle(&env)?;
+        let (_, index, _) = Self::pending_interest(&env)?;
+        let collateral: i128 = env
+            .storage()
+            .persistent()
+            .get(&PairDataKey::Collateral(user.clone()))
+            .unwrap_or(0);
+        Ok(HealthFactor {
+            debt_value: Self::debt_at(&env, &user, index)?,
+            collateral_value: Self::collateral_value(
+                collateral,
+                Self::collateral_price_bps(&env) as i128,
+            )?,
+            threshold_bps: env
+                .storage()
+                .instance()
+                .get(&PairDataKey::CollateralFactorBps)
+                .unwrap(),
+            ledger: env.ledger().sequence(),
+        })
+    }
+
     pub fn get_totals(env: Env) -> Result<(i128, i128), IsolatedLendingError> {
         Self::require_init(&env)?;
         Ok((
@@ -957,6 +999,14 @@ impl IsolatedLendingPair {
             .instance()
             .get(&PairDataKey::CollateralPriceBps)
             .unwrap_or(10_000)
+    }
+
+    /// `collateral` valued in debt-token units at `price_bps`.
+    fn collateral_value(collateral: i128, price_bps: i128) -> Result<i128, IsolatedLendingError> {
+        collateral
+            .checked_mul(price_bps)
+            .and_then(|v| v.checked_div(BPS_DENOMINATOR))
+            .ok_or(IsolatedLendingError::MathOverflow)
     }
 
     fn spendable_liquidity(env: &Env) -> Result<i128, IsolatedLendingError> {
@@ -2085,5 +2135,91 @@ mod test {
             factory.try_create_pair(&admin, &a, &b, &8_000),
             Err(Ok(IsolatedLendingError::PairAlreadyExists))
         ));
+    }
+
+    // ── Health-factor components (#1487) ────────────────────────────
+
+    #[test]
+    fn health_factor_tracks_collateral_price_movement() {
+        let s = setup();
+        let liquidator = Address::generate(&s.env);
+        mint(&s.env, &s.debt_token, &liquidator, 80);
+
+        // 80 <= 100 * 80%: backed, and liquidation agrees.
+        assert_eq!(
+            s.pair.get_health_factor(&s.borrower),
+            HealthFactor {
+                debt_value: 80,
+                collateral_value: 100,
+                threshold_bps: 8_000,
+                ledger: s.env.ledger().sequence(),
+            }
+        );
+        assert_eq!(
+            s.pair.try_liquidate(&liquidator, &s.borrower, &1, &80),
+            Err(Ok(IsolatedLendingError::PositionStillBacked))
+        );
+
+        // A 10% price drop: 80 > 90 * 80% = 72, and liquidation agrees.
+        s.pair.set_collateral_price(&s.admin, &9_000);
+        let health = s.pair.get_health_factor(&s.borrower);
+        assert_eq!((health.debt_value, health.collateral_value), (80, 90));
+        assert_eq!(s.pair.liquidate(&liquidator, &s.borrower, &1, &80), 88);
+    }
+
+    #[test]
+    fn health_factor_reports_debt_accrued_to_the_calculation_ledger() {
+        let s = setup();
+        s.pair.set_interest_rate(&s.admin, &RATE);
+        set_ledger(&s.env, 2);
+
+        let health = s.pair.get_health_factor(&s.borrower);
+        assert_eq!((health.debt_value, health.ledger), (100, 2));
+        assert_eq!(s.pair.get_position(&s.borrower).1, health.debt_value);
+    }
+
+    #[test]
+    fn health_factor_with_empty_debt() {
+        let s = setup();
+        s.pair.repay(&s.borrower, &80);
+
+        let health = s.pair.get_health_factor(&s.borrower);
+        assert_eq!((health.debt_value, health.collateral_value), (0, 100));
+
+        let stranger = Address::generate(&s.env);
+        assert_eq!(
+            s.pair.get_health_factor(&stranger),
+            HealthFactor {
+                debt_value: 0,
+                collateral_value: 0,
+                threshold_bps: 8_000,
+                ledger: s.env.ledger().sequence(),
+            }
+        );
+    }
+
+    #[test]
+    fn health_factor_rejects_an_invalid_oracle_state() {
+        let s = setup();
+        let oracle = with_oracle_policy(&s);
+        assert_eq!(
+            s.pair.try_get_health_factor(&s.borrower),
+            Err(Ok(IsolatedLendingError::OracleQuoteMissing))
+        );
+
+        s.pair.push_oracle_quote(&oracle, &10_000, &7_999);
+        assert_eq!(
+            s.pair.try_get_health_factor(&s.borrower),
+            Err(Ok(IsolatedLendingError::OracleConfidenceTooLow))
+        );
+
+        s.pair.push_oracle_quote(&oracle, &10_000, &9_000);
+        assert_eq!(s.pair.get_health_factor(&s.borrower).collateral_value, 200);
+
+        set_ledger(&s.env, 11);
+        assert_eq!(
+            s.pair.try_get_health_factor(&s.borrower),
+            Err(Ok(IsolatedLendingError::OracleQuoteStale))
+        );
     }
 }
